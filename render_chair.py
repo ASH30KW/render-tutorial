@@ -30,11 +30,28 @@ bounds = combined.bounds
 center = (bounds[0] + bounds[1]) / 2.0
 scale = np.max(bounds[1] - bounds[0])
 
-light_pos = [0.5, 1.0, 0.5]
+# 从 GLB 文件读取相机参数
+cam = scene.camera
+cam_transform = scene.camera_transform
+cam_pos = cam_transform[:3, 3]
+cam_fov = cam.fov
+cam_res = cam.resolution
 
-rotation_x = 20.0
+# 从 GLB 文件读取点光源（包含位置）
+lights = []
+for light in scene.lights:
+    color = np.array(light.color[:3], dtype=np.float32) / 255.0
+    transform, _ = scene.graph.get(light.name)
+    pos = transform[:3, 3]
+    lights.append({
+        "color": color,
+        "intensity": light.intensity,
+        "position": pos,
+    })
+
+rotation_x = 0.0
 rotation_y = 0.0
-zoom = 2.0
+zoom_offset = 0.0
 last_mouse = [0, 0]
 mouse_button = None
 
@@ -58,21 +75,30 @@ def init():
     glClearColor(0.15, 0.15, 0.15, 1.0)
     glEnable(GL_DEPTH_TEST)
     glEnable(GL_LIGHTING)
-    glEnable(GL_LIGHT0)
     glEnable(GL_TEXTURE_2D)
 
-    glLightfv(GL_LIGHT0, GL_POSITION, [light_pos[0], light_pos[1], light_pos[2], 1.0])
-    glLightfv(GL_LIGHT0, GL_DIFFUSE, [1.0, 1.0, 1.0, 1.0])
-    glLightfv(GL_LIGHT0, GL_SPECULAR, [1.0, 1.0, 1.0, 1.0])
-    glLightfv(GL_LIGHT0, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
-    glLightf(GL_LIGHT0, GL_CONSTANT_ATTENUATION, 1.0)
-    glLightf(GL_LIGHT0, GL_LINEAR_ATTENUATION, 0.05)
-    glLightf(GL_LIGHT0, GL_QUADRATIC_ATTENUATION, 0.01)
+    # 设置 GLB 文件中的点光源
+    gl_lights = [GL_LIGHT0, GL_LIGHT1, GL_LIGHT2, GL_LIGHT3]
+    for i, light in enumerate(lights):
+        if i >= len(gl_lights):
+            break
+        gl_id = gl_lights[i]
+        glEnable(gl_id)
+        c = light["color"] * light["intensity"]
+        p = light["position"]
+        glLightfv(gl_id, GL_POSITION, [p[0], p[1], p[2], 1.0])
+        glLightfv(gl_id, GL_DIFFUSE, [c[0], c[1], c[2], 1.0])
+        glLightfv(gl_id, GL_SPECULAR, [c[0], c[1], c[2], 1.0])
+        glLightfv(gl_id, GL_AMBIENT, [c[0] * 0.3, c[1] * 0.3, c[2] * 0.3, 1.0])
+        glLightf(gl_id, GL_CONSTANT_ATTENUATION, 1.0)
+        glLightf(gl_id, GL_LINEAR_ATTENUATION, 0.05)
+        glLightf(gl_id, GL_QUADRATIC_ATTENUATION, 0.01)
 
+    # PBR 材质参数: metallic=0, roughness=0 -> 高光泽非金属
     glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
     glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [1.0, 1.0, 1.0, 1.0])
-    glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.3, 0.3, 0.3, 1.0])
-    glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 30.0)
+    glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [1.0, 1.0, 1.0, 1.0])
+    glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 128.0)
 
     for m in meshes:
         m["tex_id"] = upload_texture(m["tex_img"])
@@ -82,11 +108,17 @@ def display():
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
     glLoadIdentity()
 
-    gluLookAt(0, 0, zoom, 0, 0, 0, 0, 1, 0)
+    eye = cam_pos.copy()
+    eye[2] += zoom_offset
+    target = [center[0], center[1], center[2]]
+    gluLookAt(eye[0], eye[1], eye[2],
+              target[0], target[1], target[2],
+              0, 1, 0)
+
     glRotatef(rotation_x, 1, 0, 0)
     glRotatef(rotation_y, 0, 1, 0)
-    glScalef(1.0 / scale * 2, 1.0 / scale * 2, 1.0 / scale * 2)
     glTranslatef(-center[0], -center[1], -center[2])
+    glTranslatef(center[0], center[1], center[2])
 
     glEnable(GL_TEXTURE_2D)
     glEnable(GL_LIGHTING)
@@ -108,13 +140,17 @@ def display():
         glDisableClientState(GL_NORMAL_ARRAY)
         glDisableClientState(GL_TEXTURE_COORD_ARRAY)
 
+    # 绘制光源标记（黄色小球）
     glDisable(GL_TEXTURE_2D)
     glDisable(GL_LIGHTING)
-    glColor3f(1.0, 1.0, 0.0)
-    glPushMatrix()
-    glTranslatef(light_pos[0], light_pos[1], light_pos[2])
-    glutSolidSphere(0.03, 16, 16)
-    glPopMatrix()
+    light_colors = [[1.0, 1.0, 0.0], [1.0, 0.5, 0.0]]
+    for i, light in enumerate(lights):
+        p = light["position"]
+        glColor3f(*light_colors[i % len(light_colors)])
+        glPushMatrix()
+        glTranslatef(p[0], p[1], p[2])
+        glutSolidSphere(0.02, 16, 16)
+        glPopMatrix()
 
     glutSwapBuffers()
 
@@ -125,7 +161,7 @@ def reshape(w, h):
     glViewport(0, 0, w, h)
     glMatrixMode(GL_PROJECTION)
     glLoadIdentity()
-    gluPerspective(45.0, w / h, 0.01, 100.0)
+    gluPerspective(float(cam_fov[1]), w / h, 0.01, 100.0)
     glMatrixMode(GL_MODELVIEW)
 
 
@@ -139,15 +175,15 @@ def mouse(button, state, x, y):
 
 
 def motion(x, y):
-    global rotation_x, rotation_y, zoom, last_mouse
+    global rotation_x, rotation_y, zoom_offset, last_mouse
     dx = x - last_mouse[0]
     dy = y - last_mouse[1]
     if mouse_button == GLUT_LEFT_BUTTON:
         rotation_y += dx * 0.5
         rotation_x += dy * 0.5
     elif mouse_button == GLUT_RIGHT_BUTTON:
-        zoom += dy * 0.01
-        zoom = max(0.5, min(10.0, zoom))
+        zoom_offset -= dy * 0.005
+        zoom_offset = max(-1.0, min(3.0, zoom_offset))
     last_mouse = [x, y]
     glutPostRedisplay()
 
@@ -159,7 +195,7 @@ def keyboard(key, x, y):
 
 glutInit(sys.argv)
 glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH)
-glutInitWindowSize(1024, 768)
+glutInitWindowSize(int(cam_res[0]), int(cam_res[1]))
 glutCreateWindow(b"Chair Viewer")
 init()
 glutDisplayFunc(display)
@@ -167,5 +203,9 @@ glutReshapeFunc(reshape)
 glutMouseFunc(mouse)
 glutMotionFunc(motion)
 glutKeyboardFunc(keyboard)
-print("Controls: Left-drag to rotate, Right-drag to zoom, Esc to quit")
+print(f"相机位置: {cam_pos}")
+print(f"相机FOV: {cam_fov}")
+print(f"窗口分辨率: {cam_res}")
+print(f"光源数量: {len(lights)}")
+print("操作: 左键拖拽旋转, 右键拖拽缩放, Esc退出")
 glutMainLoop()
