@@ -33,6 +33,10 @@ combined = trimesh.util.concatenate(scene.dump())
 bounds = combined.bounds
 center = (bounds[0] + bounds[1]) / 2.0
 
+light_pos = [0.5, 1.0, 0.5]
+light_color = [1.0, 1.0, 1.0]
+light_intensity = 3.0
+
 # ============ GLSL 着色器 ============
 
 PBR_VS = """
@@ -63,11 +67,52 @@ in vec3 Normal;
 in vec2 UV;
 
 uniform sampler2D albedoMap;
+uniform vec3 camPos;
+uniform vec3 lightPos;
+uniform vec3 lightColor;
+uniform float lightIntensity;
+
+const float PI = 3.14159265359;
 
 void main(){
-    vec3 color = texture(albedoMap, UV).rgb;
+    vec3 albedo = pow(texture(albedoMap, UV).rgb, vec3(2.2));
+    vec3 N = normalize(Normal);
+    vec3 V = normalize(camPos - FragPos);
+    vec3 L = normalize(lightPos - FragPos);
+    vec3 H = normalize(V + L);
+
+    float dist = length(lightPos - FragPos);
+    float attenuation = 1.0 / (dist * dist);
+    vec3 radiance = lightColor * lightIntensity * attenuation;
+
+    float NdotL = max(dot(N, L), 0.0);
+    vec3 diffuse = albedo / PI * radiance * NdotL;
+
+    float spec = pow(max(dot(N, H), 0.0), 64.0);
+    vec3 specular = vec3(0.04) * spec * radiance * NdotL;
+
+    vec3 ambient = vec3(0.03) * albedo;
+    vec3 color = ambient + diffuse + specular;
+
+    color = color / (color + vec3(1.0));
+    color = pow(color, vec3(1.0 / 2.2));
+
     FragColor = vec4(color, 1.0);
 }
+"""
+
+LIGHT_VS = """
+#version 330 core
+layout(location=0) in vec3 aPos;
+uniform mat4 mvp;
+void main(){ gl_Position = mvp * vec4(aPos, 1.0); }
+"""
+
+LIGHT_FS = """
+#version 330 core
+out vec4 FragColor;
+uniform vec3 markerColor;
+void main(){ FragColor = vec4(markerColor, 1.0); }
 """
 
 
@@ -151,6 +196,38 @@ def create_mesh_vao(verts, normals, uvs, faces):
     glBindVertexArray(0)
     return vao, len(faces) * 3
 
+def create_sphere_vao(radius=0.015, slices=16, stacks=16):
+    verts = []
+    for i in range(stacks + 1):
+        phi = np.pi * i / stacks
+        for j in range(slices + 1):
+            theta = 2.0 * np.pi * j / slices
+            verts.append([
+                radius * np.sin(phi) * np.cos(theta),
+                radius * np.cos(phi),
+                radius * np.sin(phi) * np.sin(theta),
+            ])
+    verts = np.array(verts, dtype=np.float32)
+    indices = []
+    for i in range(stacks):
+        for j in range(slices):
+            a = i * (slices + 1) + j
+            b = a + slices + 1
+            indices.extend([a, b, a+1, b, b+1, a+1])
+    indices = np.array(indices, dtype=np.uint32)
+    vao = glGenVertexArrays(1)
+    vbo = glGenBuffers(1)
+    ebo = glGenBuffers(1)
+    glBindVertexArray(vao)
+    glBindBuffer(GL_ARRAY_BUFFER, vbo)
+    glBufferData(GL_ARRAY_BUFFER, verts.nbytes, verts, GL_STATIC_DRAW)
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo)
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_STATIC_DRAW)
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
+    glEnableVertexAttribArray(0)
+    glBindVertexArray(0)
+    return vao, len(indices)
+
 # ============ 主程序 ============
 
 def main():
@@ -177,6 +254,8 @@ def main():
     glClearColor(0.15, 0.15, 0.15, 1.0)
 
     pbr_shader = compile_shader(PBR_VS, PBR_FS)
+    light_shader = compile_shader(LIGHT_VS, LIGHT_FS)
+    sphere_vao, sphere_count = create_sphere_vao()
 
     gpu_meshes = []
     for m in mesh_data:
@@ -209,6 +288,10 @@ def main():
         glUniformMatrix4fv(glGetUniformLocation(pbr_shader, "view"), 1, GL_FALSE, glm.value_ptr(view))
         glUniformMatrix4fv(glGetUniformLocation(pbr_shader, "projection"), 1, GL_FALSE, glm.value_ptr(projection))
         glUniformMatrix3fv(glGetUniformLocation(pbr_shader, "normalMatrix"), 1, GL_FALSE, glm.value_ptr(normal_mat))
+        glUniform3f(glGetUniformLocation(pbr_shader, "camPos"), eye.x, eye.y, eye.z)
+        glUniform3f(glGetUniformLocation(pbr_shader, "lightPos"), *light_pos)
+        glUniform3f(glGetUniformLocation(pbr_shader, "lightColor"), *light_color)
+        glUniform1f(glGetUniformLocation(pbr_shader, "lightIntensity"), light_intensity)
 
         for gm in gpu_meshes:
             glActiveTexture(GL_TEXTURE0)
@@ -216,6 +299,15 @@ def main():
             glUniform1i(glGetUniformLocation(pbr_shader, "albedoMap"), 0)
             glBindVertexArray(gm["vao"])
             glDrawElements(GL_TRIANGLES, gm["count"], GL_UNSIGNED_INT, None)
+
+        # 绘制光源标记（黄色小球）
+        glUseProgram(light_shader)
+        m_light = glm.translate(glm.mat4(1.0), glm.vec3(*light_pos))
+        mvp = projection * view * model * m_light
+        glUniformMatrix4fv(glGetUniformLocation(light_shader, "mvp"), 1, GL_FALSE, glm.value_ptr(mvp))
+        glUniform3f(glGetUniformLocation(light_shader, "markerColor"), 1.0, 1.0, 0.0)
+        glBindVertexArray(sphere_vao)
+        glDrawElements(GL_TRIANGLES, sphere_count, GL_UNSIGNED_INT, None)
 
         glfw.swap_buffers(window)
 
