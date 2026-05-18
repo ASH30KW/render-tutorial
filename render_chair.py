@@ -21,25 +21,37 @@ cam_res = cam.resolution
 mesh_data = []
 for name, geom in scene.geometry.items():
     mat = geom.visual.material
+    metallic = mat.metallicFactor if mat.metallicFactor is not None else 0.0
+    roughness = 0.7
     mesh_data.append({
         "vertices": np.array(geom.vertices, dtype=np.float32),
         "normals": np.array(geom.vertex_normals, dtype=np.float32),
         "uvs": np.array(geom.visual.uv, dtype=np.float32),
         "faces": np.array(geom.faces, dtype=np.uint32),
         "tex_img": mat.baseColorTexture,
+        "metallic": metallic,
+        "roughness": roughness,
     })
 
 combined = trimesh.util.concatenate(scene.dump())
 bounds = combined.bounds
 center = (bounds[0] + bounds[1]) / 2.0
 
-light_pos = [0.5, 1.0, 0.5]
-light_color = [1.0, 1.0, 1.0]
-light_intensity = 3.0
+# ============ 加载 cubemap 图片 ============
+
+def load_cubemap_faces(folder):
+    names = {"px": "posx.jpg", "nx": "negx.jpg", "py": "posy.jpg",
+             "ny": "negy.jpg", "pz": "posz.jpg", "nz": "negz.jpg"}
+    faces = {}
+    for key, filename in names.items():
+        face = Image.open(f"{folder}/{filename}").convert("RGB")
+        faces[key] = face
+    face_size = faces["px"].width
+    return faces, face_size
 
 # ============ GLSL 着色器 ============
 
-PBR_VS = """
+MAIN_VS = """
 #version 330 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNormal;
@@ -59,7 +71,7 @@ void main(){
 }
 """
 
-PBR_FS = """
+MAIN_FS = """
 #version 330 core
 out vec4 FragColor;
 in vec3 FragPos;
@@ -67,32 +79,30 @@ in vec3 Normal;
 in vec2 UV;
 
 uniform sampler2D albedoMap;
+uniform samplerCube envMap;
 uniform vec3 camPos;
-uniform vec3 lightPos;
-uniform vec3 lightColor;
-uniform float lightIntensity;
-
-const float PI = 3.14159265359;
+uniform float metallic;
+uniform float roughness;
 
 void main(){
     vec3 albedo = pow(texture(albedoMap, UV).rgb, vec3(2.2));
     vec3 N = normalize(Normal);
     vec3 V = normalize(camPos - FragPos);
-    vec3 L = normalize(lightPos - FragPos);
-    vec3 H = normalize(V + L);
+    vec3 R = reflect(-V, N);
 
-    float dist = length(lightPos - FragPos);
-    float attenuation = 1.0 / (dist * dist);
-    vec3 radiance = lightColor * lightIntensity * attenuation;
+    float NdotV = max(dot(N, V), 0.0);
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    vec3 F = F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(1.0 - NdotV, 5.0);
 
-    float NdotL = max(dot(N, L), 0.0);
-    vec3 diffuse = albedo / PI * radiance * NdotL;
+    float lod = roughness * 4.0;
+    vec3 envColor = textureLod(envMap, R, lod).rgb;
+    vec3 specular = F * envColor * (1.0 - roughness);
 
-    float spec = pow(max(dot(N, H), 0.0), 64.0);
-    vec3 specular = vec3(0.04) * spec * radiance * NdotL;
+    vec3 irradiance = textureLod(envMap, N, 4.0).rgb;
+    vec3 kD = (1.0 - F) * (1.0 - metallic);
+    vec3 diffuse = kD * albedo * irradiance;
 
-    vec3 ambient = vec3(0.03) * albedo;
-    vec3 color = ambient + diffuse + specular;
+    vec3 color = diffuse + specular;
 
     color = color / (color + vec3(1.0));
     color = pow(color, vec3(1.0 / 2.2));
@@ -101,20 +111,29 @@ void main(){
 }
 """
 
-LIGHT_VS = """
+SKYBOX_VS = """
 #version 330 core
 layout(location=0) in vec3 aPos;
-uniform mat4 mvp;
-void main(){ gl_Position = mvp * vec4(aPos, 1.0); }
+out vec3 localPos;
+uniform mat4 projection;
+uniform mat4 view;
+void main(){
+    localPos = aPos;
+    vec4 pos = projection * mat4(mat3(view)) * vec4(aPos, 1.0);
+    gl_Position = pos.xyww;
+}
 """
 
-LIGHT_FS = """
+SKYBOX_FS = """
 #version 330 core
 out vec4 FragColor;
-uniform vec3 markerColor;
-void main(){ FragColor = vec4(markerColor, 1.0); }
+in vec3 localPos;
+uniform samplerCube envMap;
+void main(){
+    vec3 color = texture(envMap, localPos).rgb;
+    FragColor = vec4(color, 1.0);
+}
 """
-
 
 # ============ 交互 ============
 
@@ -176,6 +195,24 @@ def upload_texture_2d(img):
     glGenerateMipmap(GL_TEXTURE_2D)
     return tex
 
+def upload_cubemap(faces):
+    # OpenGL cubemap 面顺序: +X, -X, +Y, -Y, +Z, -Z
+    order = ["px", "nx", "py", "ny", "pz", "nz"]
+    tex = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_CUBE_MAP, tex)
+    for i, name in enumerate(order):
+        face = faces[name]
+        data = face.tobytes()
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_SRGB,
+                     face.width, face.height, 0, GL_RGB, GL_UNSIGNED_BYTE, data)
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glGenerateMipmap(GL_TEXTURE_CUBE_MAP)
+    return tex
+
 def create_mesh_vao(verts, normals, uvs, faces):
     interleaved = np.hstack([verts, normals, uvs]).astype(np.float32)
     vao = glGenVertexArrays(1)
@@ -196,37 +233,24 @@ def create_mesh_vao(verts, normals, uvs, faces):
     glBindVertexArray(0)
     return vao, len(faces) * 3
 
-def create_sphere_vao(radius=0.015, slices=16, stacks=16):
-    verts = []
-    for i in range(stacks + 1):
-        phi = np.pi * i / stacks
-        for j in range(slices + 1):
-            theta = 2.0 * np.pi * j / slices
-            verts.append([
-                radius * np.sin(phi) * np.cos(theta),
-                radius * np.cos(phi),
-                radius * np.sin(phi) * np.sin(theta),
-            ])
-    verts = np.array(verts, dtype=np.float32)
-    indices = []
-    for i in range(stacks):
-        for j in range(slices):
-            a = i * (slices + 1) + j
-            b = a + slices + 1
-            indices.extend([a, b, a+1, b, b+1, a+1])
-    indices = np.array(indices, dtype=np.uint32)
+def create_cube_vao():
+    verts = np.array([
+        -1, 1,-1, -1,-1,-1, 1,-1,-1, 1,-1,-1, 1, 1,-1, -1, 1,-1,
+        -1,-1, 1, -1,-1,-1, -1, 1,-1, -1, 1,-1, -1, 1, 1, -1,-1, 1,
+         1,-1,-1,  1,-1, 1,  1, 1, 1,  1, 1, 1,  1, 1,-1,  1,-1,-1,
+        -1,-1, 1, -1, 1, 1,  1, 1, 1,  1, 1, 1,  1,-1, 1, -1,-1, 1,
+        -1, 1,-1,  1, 1,-1,  1, 1, 1,  1, 1, 1, -1, 1, 1, -1, 1,-1,
+        -1,-1,-1, -1,-1, 1,  1,-1,-1,  1,-1,-1, -1,-1, 1,  1,-1, 1,
+    ], dtype=np.float32)
     vao = glGenVertexArrays(1)
     vbo = glGenBuffers(1)
-    ebo = glGenBuffers(1)
     glBindVertexArray(vao)
     glBindBuffer(GL_ARRAY_BUFFER, vbo)
     glBufferData(GL_ARRAY_BUFFER, verts.nbytes, verts, GL_STATIC_DRAW)
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo)
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_STATIC_DRAW)
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, ctypes.c_void_p(0))
     glEnableVertexAttribArray(0)
     glBindVertexArray(0)
-    return vao, len(indices)
+    return vao
 
 # ============ 主程序 ============
 
@@ -239,7 +263,7 @@ def main():
     glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
 
     w, h = int(cam_res[0]), int(cam_res[1])
-    window = glfw.create_window(w, h, "Chair Viewer (PBR)", None, None)
+    window = glfw.create_window(w, h, "Chair Viewer (Environment Map)", None, None)
     if not window:
         glfw.terminate()
         sys.exit(1)
@@ -251,17 +275,27 @@ def main():
     glfw.set_key_callback(window, key_callback)
 
     glEnable(GL_DEPTH_TEST)
+    glDepthFunc(GL_LESS)
+    glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS)
     glClearColor(0.15, 0.15, 0.15, 1.0)
 
-    pbr_shader = compile_shader(PBR_VS, PBR_FS)
-    light_shader = compile_shader(LIGHT_VS, LIGHT_FS)
-    sphere_vao, sphere_count = create_sphere_vao()
+    print("正在加载环境 cubemap...")
+    cube_faces, face_size = load_cubemap_faces("/home/ai/Desktop/hotel_room_cubemap")
+    env_cubemap = upload_cubemap(cube_faces)
+    print(f"环境 cubemap 加载完成 (每面 {face_size}x{face_size})")
+
+    main_shader = compile_shader(MAIN_VS, MAIN_FS)
+    skybox_shader = compile_shader(SKYBOX_VS, SKYBOX_FS)
+    cube_vao = create_cube_vao()
 
     gpu_meshes = []
     for m in mesh_data:
         vao, count = create_mesh_vao(m["vertices"], m["normals"], m["uvs"], m["faces"])
         tex = upload_texture_2d(m["tex_img"])
-        gpu_meshes.append({"vao": vao, "count": count, "tex": tex})
+        gpu_meshes.append({
+            "vao": vao, "count": count, "tex": tex,
+            "metallic": m["metallic"], "roughness": m["roughness"],
+        })
 
     print(f"相机位置: {cam_pos}, FOV: {cam_fov}")
     print("操作: 左键旋转, 右键/滚轮缩放, Esc退出")
@@ -283,31 +317,41 @@ def main():
         model = glm.rotate(model, glm.radians(rotation_y), glm.vec3(0, 1, 0))
         normal_mat = glm.mat3(glm.transpose(glm.inverse(model)))
 
-        glUseProgram(pbr_shader)
-        glUniformMatrix4fv(glGetUniformLocation(pbr_shader, "model"), 1, GL_FALSE, glm.value_ptr(model))
-        glUniformMatrix4fv(glGetUniformLocation(pbr_shader, "view"), 1, GL_FALSE, glm.value_ptr(view))
-        glUniformMatrix4fv(glGetUniformLocation(pbr_shader, "projection"), 1, GL_FALSE, glm.value_ptr(projection))
-        glUniformMatrix3fv(glGetUniformLocation(pbr_shader, "normalMatrix"), 1, GL_FALSE, glm.value_ptr(normal_mat))
-        glUniform3f(glGetUniformLocation(pbr_shader, "camPos"), eye.x, eye.y, eye.z)
-        glUniform3f(glGetUniformLocation(pbr_shader, "lightPos"), *light_pos)
-        glUniform3f(glGetUniformLocation(pbr_shader, "lightColor"), *light_color)
-        glUniform1f(glGetUniformLocation(pbr_shader, "lightIntensity"), light_intensity)
+        # 绘制椅子
+        glUseProgram(main_shader)
+        glUniformMatrix4fv(glGetUniformLocation(main_shader, "model"), 1, GL_FALSE, glm.value_ptr(model))
+        glUniformMatrix4fv(glGetUniformLocation(main_shader, "view"), 1, GL_FALSE, glm.value_ptr(view))
+        glUniformMatrix4fv(glGetUniformLocation(main_shader, "projection"), 1, GL_FALSE, glm.value_ptr(projection))
+        glUniformMatrix3fv(glGetUniformLocation(main_shader, "normalMatrix"), 1, GL_FALSE, glm.value_ptr(normal_mat))
+        glUniform3f(glGetUniformLocation(main_shader, "camPos"), eye.x, eye.y, eye.z)
+
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(GL_TEXTURE_CUBE_MAP, env_cubemap)
+        glUniform1i(glGetUniformLocation(main_shader, "envMap"), 1)
 
         for gm in gpu_meshes:
+            glUniform1f(glGetUniformLocation(main_shader, "metallic"), gm["metallic"])
+            glUniform1f(glGetUniformLocation(main_shader, "roughness"), gm["roughness"])
             glActiveTexture(GL_TEXTURE0)
             glBindTexture(GL_TEXTURE_2D, gm["tex"])
-            glUniform1i(glGetUniformLocation(pbr_shader, "albedoMap"), 0)
+            glUniform1i(glGetUniformLocation(main_shader, "albedoMap"), 0)
             glBindVertexArray(gm["vao"])
             glDrawElements(GL_TRIANGLES, gm["count"], GL_UNSIGNED_INT, None)
 
-        # 绘制光源标记（黄色小球）
-        glUseProgram(light_shader)
-        m_light = glm.translate(glm.mat4(1.0), glm.vec3(*light_pos))
-        mvp = projection * view * model * m_light
-        glUniformMatrix4fv(glGetUniformLocation(light_shader, "mvp"), 1, GL_FALSE, glm.value_ptr(mvp))
-        glUniform3f(glGetUniformLocation(light_shader, "markerColor"), 1.0, 1.0, 0.0)
-        glBindVertexArray(sphere_vao)
-        glDrawElements(GL_TRIANGLES, sphere_count, GL_UNSIGNED_INT, None)
+        # 绘制天空盒（跟随旋转）
+        glDepthFunc(GL_LEQUAL)
+        glDepthMask(GL_FALSE)
+        glUseProgram(skybox_shader)
+        skybox_view = view * glm.mat4(model)
+        glUniformMatrix4fv(glGetUniformLocation(skybox_shader, "projection"), 1, GL_FALSE, glm.value_ptr(projection))
+        glUniformMatrix4fv(glGetUniformLocation(skybox_shader, "view"), 1, GL_FALSE, glm.value_ptr(skybox_view))
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_CUBE_MAP, env_cubemap)
+        glUniform1i(glGetUniformLocation(skybox_shader, "envMap"), 0)
+        glBindVertexArray(cube_vao)
+        glDrawArrays(GL_TRIANGLES, 0, 36)
+        glDepthMask(GL_TRUE)
+        glDepthFunc(GL_LESS)
 
         glfw.swap_buffers(window)
 
