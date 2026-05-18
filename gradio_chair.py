@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+"""Gradio 交互式 PBR 椅子渲染器 — 可调节 roughness, metallic, 旋转, 环境贴图等"""
+
 import trimesh
 import numpy as np
 import glfw
@@ -5,49 +8,34 @@ import glm
 from OpenGL.GL import *
 from OpenGL.GL import shaders
 from PIL import Image
-import sys
 import ctypes
+import threading
+import gradio as gr
+import os
 
-# ============ 加载 GLB 文件 ============
+# ============ 加载 GLB ============
 
 scene = trimesh.load("/home/ai/Desktop/chair.glb")
-
 cam = scene.camera
 cam_transform = scene.camera_transform
 cam_pos = cam_transform[:3, 3].copy()
 cam_fov = float(cam.fov[1])
-cam_res = cam.resolution
 
 mesh_data = []
 for name, geom in scene.geometry.items():
     mat = geom.visual.material
-    metallic = mat.metallicFactor if mat.metallicFactor is not None else 0.0
-    roughness = 0.7
     mesh_data.append({
         "vertices": np.array(geom.vertices, dtype=np.float32),
         "normals": np.array(geom.vertex_normals, dtype=np.float32),
         "uvs": np.array(geom.visual.uv, dtype=np.float32),
         "faces": np.array(geom.faces, dtype=np.uint32),
         "tex_img": mat.baseColorTexture,
-        "metallic": metallic,
-        "roughness": roughness,
     })
 
 combined = trimesh.util.concatenate(scene.dump())
-bounds = combined.bounds
-center = (bounds[0] + bounds[1]) / 2.0
+center = (combined.bounds[0] + combined.bounds[1]) / 2.0
 
-# ============ 加载 cubemap ============
-
-def load_cubemap_faces(folder):
-    names = {"px": "posx.jpg", "nx": "negx.jpg", "py": "posy.jpg",
-             "ny": "negy.jpg", "pz": "posz.jpg", "nz": "negz.jpg"}
-    faces = {}
-    for key, filename in names.items():
-        faces[key] = Image.open(f"{folder}/{filename}").convert("RGB")
-    return faces, faces["px"].width
-
-# ============ GLSL 着色器 ============
+# ============ 着色器 ============
 
 CUBE_VS = """
 #version 330 core
@@ -283,46 +271,7 @@ void main(){
 }
 """
 
-# ============ 交互 ============
-
-rotation_x = 0.0
-rotation_y = 0.0
-zoom_offset = 0.0
-last_mouse = [0.0, 0.0]
-mouse_left = False
-mouse_right = False
-
-def mouse_button_callback(window, button, action, mods):
-    global mouse_left, mouse_right, last_mouse
-    x, y = glfw.get_cursor_pos(window)
-    last_mouse = [x, y]
-    if button == glfw.MOUSE_BUTTON_LEFT:
-        mouse_left = (action == glfw.PRESS)
-    elif button == glfw.MOUSE_BUTTON_RIGHT:
-        mouse_right = (action == glfw.PRESS)
-
-def cursor_pos_callback(window, x, y):
-    global rotation_x, rotation_y, zoom_offset, last_mouse
-    dx = x - last_mouse[0]
-    dy = y - last_mouse[1]
-    if mouse_left:
-        rotation_y += dx * 0.3
-        rotation_x += dy * 0.3
-    if mouse_right:
-        zoom_offset -= dy * 0.005
-        zoom_offset = max(-1.0, min(3.0, zoom_offset))
-    last_mouse = [x, y]
-
-def scroll_callback(window, xoff, yoff):
-    global zoom_offset
-    zoom_offset += yoff * 0.1
-    zoom_offset = max(-1.0, min(3.0, zoom_offset))
-
-def key_callback(window, key, scancode, action, mods):
-    if key == glfw.KEY_ESCAPE and action == glfw.PRESS:
-        glfw.set_window_should_close(window, True)
-
-# ============ OpenGL 工具函数 ============
+# ============ OpenGL 工具 ============
 
 def compile_shader(vs_src, fs_src):
     vs = shaders.compileShader(vs_src, GL_VERTEX_SHADER)
@@ -359,6 +308,14 @@ def upload_cubemap(faces):
     glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
     glGenerateMipmap(GL_TEXTURE_CUBE_MAP)
     return tex
+
+def load_cubemap_faces(folder):
+    names = {"px": "posx.jpg", "nx": "negx.jpg", "py": "posy.jpg",
+             "ny": "negy.jpg", "pz": "posz.jpg", "nz": "negz.jpg"}
+    faces = {}
+    for key, filename in names.items():
+        faces[key] = Image.open(f"{folder}/{filename}").convert("RGB")
+    return faces, faces["px"].width
 
 def create_mesh_vao(verts, normals, uvs, faces):
     interleaved = np.hstack([verts, normals, uvs]).astype(np.float32)
@@ -434,8 +391,7 @@ def generate_ibl(env_cubemap, cube_vao, quad_vao):
     glBindFramebuffer(GL_FRAMEBUFFER, fbo)
     glBindRenderbuffer(GL_RENDERBUFFER, rbo)
 
-    # 1. 辐照度卷积
-    print("  计算辐照度贴图...")
+    print("  辐照度贴图...")
     irr_size = 32
     irr_cubemap = glGenTextures(1)
     glBindTexture(GL_TEXTURE_CUBE_MAP, irr_cubemap)
@@ -468,8 +424,7 @@ def generate_ibl(env_cubemap, cube_vao, quad_vao):
         glBindVertexArray(cube_vao)
         glDrawArrays(GL_TRIANGLES, 0, 36)
 
-    # 2. 预过滤环境贴图
-    print("  计算预过滤环境贴图...")
+    print("  预过滤环境贴图...")
     pref_size = 128
     pref_cubemap = glGenTextures(1)
     glBindTexture(GL_TEXTURE_CUBE_MAP, pref_cubemap)
@@ -508,8 +463,7 @@ def generate_ibl(env_cubemap, cube_vao, quad_vao):
             glBindVertexArray(cube_vao)
             glDrawArrays(GL_TRIANGLES, 0, 36)
 
-    # 3. BRDF LUT
-    print("  计算 BRDF LUT...")
+    print("  BRDF LUT...")
     brdf_size = 512
     brdf_tex = glGenTextures(1)
     glBindTexture(GL_TEXTURE_2D, brdf_tex)
@@ -532,108 +486,175 @@ def generate_ibl(env_cubemap, cube_vao, quad_vao):
     glBindFramebuffer(GL_FRAMEBUFFER, 0)
     glDeleteFramebuffers(1, [fbo])
     glDeleteRenderbuffers(1, [rbo])
-
     return irr_cubemap, pref_cubemap, brdf_tex
 
-# ============ 主程序 ============
+# ============ 离屏渲染 FBO ============
 
-def main():
+class OffscreenRenderer:
+    def __init__(self, w, h):
+        self.w, self.h = w, h
+        self.fbo = glGenFramebuffers(1)
+        self.color_tex = glGenTextures(1)
+        self.depth_rbo = glGenRenderbuffers(1)
+
+        glBindFramebuffer(GL_FRAMEBUFFER, self.fbo)
+        glBindTexture(GL_TEXTURE_2D, self.color_tex)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, None)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self.color_tex, 0)
+
+        glBindRenderbuffer(GL_RENDERBUFFER, self.depth_rbo)
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h)
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, self.depth_rbo)
+        glBindFramebuffer(GL_FRAMEBUFFER, 0)
+
+    def read_pixels(self):
+        glBindFramebuffer(GL_FRAMEBUFFER, self.fbo)
+        data = glReadPixels(0, 0, self.w, self.h, GL_RGB, GL_UNSIGNED_BYTE)
+        glBindFramebuffer(GL_FRAMEBUFFER, 0)
+        img = np.frombuffer(data, dtype=np.uint8).reshape(self.h, self.w, 3)
+        return Image.fromarray(img[::-1])
+
+
+# ============ 全局状态 ============
+
+renderer = None
+gpu_meshes = []
+pbr_shader = None
+skybox_shader = None
+cube_vao = None
+irr_cubemap = None
+pref_cubemap = None
+brdf_tex = None
+env_cubemap = None
+env_cubemaps = {}
+gl_window = None
+gl_lock = threading.Lock()
+RENDER_W, RENDER_H = 900, 675
+
+
+def init_gl():
+    global renderer, gpu_meshes, pbr_shader, skybox_shader, cube_vao
+    global irr_cubemap, pref_cubemap, brdf_tex, env_cubemap, env_cubemaps, gl_window
+
     if not glfw.init():
-        sys.exit(1)
+        raise RuntimeError("GLFW init failed")
 
     glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
     glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
     glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+    glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
 
-    w, h = int(cam_res[0]), int(cam_res[1])
-    window = glfw.create_window(w, h, "Chair Viewer (PBR + IBL)", None, None)
-    if not window:
-        glfw.terminate()
-        sys.exit(1)
-
+    window = glfw.create_window(RENDER_W, RENDER_H, "offscreen", None, None)
     glfw.make_context_current(window)
-    glfw.set_mouse_button_callback(window, mouse_button_callback)
-    glfw.set_cursor_pos_callback(window, cursor_pos_callback)
-    glfw.set_scroll_callback(window, scroll_callback)
-    glfw.set_key_callback(window, key_callback)
+    gl_window = window
 
     glEnable(GL_DEPTH_TEST)
-    glDepthFunc(GL_LESS)
     glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS)
     glClearColor(0.15, 0.15, 0.15, 1.0)
 
     cube_vao = create_cube_vao()
     quad_vao = create_quad_vao()
 
-    print("正在加载环境 cubemap...")
-    cube_faces, face_size = load_cubemap_faces("/home/ai/Desktop/Regal_Palace_Ballroom_cubemap")
-    env_cubemap = upload_cubemap(cube_faces)
-    print(f"环境 cubemap 加载完成 (每面 {face_size}x{face_size})")
+    # 扫描可用 cubemap 目录
+    desktop = "/home/ai/Desktop"
+    env_dirs = {}
+    for d in sorted(os.listdir(desktop)):
+        full = os.path.join(desktop, d)
+        if os.path.isdir(full) and os.path.exists(os.path.join(full, "posx.jpg")):
+            env_dirs[d] = full
+    print(f"找到 {len(env_dirs)} 个环境贴图: {list(env_dirs.keys())}")
 
-    print("正在预计算 IBL...")
-    irr_cubemap, pref_cubemap, brdf_tex = generate_ibl(env_cubemap, cube_vao, quad_vao)
-    print("IBL 预计算完成！\n")
+    # 加载所有环境贴图并预计算 IBL
+    for name, path in env_dirs.items():
+        print(f"\n加载环境: {name}")
+        faces, _ = load_cubemap_faces(path)
+        ecm = upload_cubemap(faces)
+        print("预计算 IBL...")
+        irr, pref, brdf = generate_ibl(ecm, cube_vao, quad_vao)
+        env_cubemaps[name] = {"env": ecm, "irr": irr, "pref": pref, "brdf": brdf}
+
+    if not env_cubemaps:
+        raise RuntimeError("没有找到 cubemap 目录")
+
+    first_env = list(env_cubemaps.keys())[0]
+    env_cubemap = env_cubemaps[first_env]["env"]
+    irr_cubemap = env_cubemaps[first_env]["irr"]
+    pref_cubemap = env_cubemaps[first_env]["pref"]
+    brdf_tex = env_cubemaps[first_env]["brdf"]
 
     pbr_shader = compile_shader(PBR_VS, PBR_FS)
     skybox_shader = compile_shader(SKYBOX_VS, SKYBOX_FS)
 
-    gpu_meshes = []
     for m in mesh_data:
         vao, count = create_mesh_vao(m["vertices"], m["normals"], m["uvs"], m["faces"])
         tex = upload_texture_2d(m["tex_img"])
-        gpu_meshes.append({
-            "vao": vao, "count": count, "tex": tex,
-            "metallic": m["metallic"], "roughness": m["roughness"],
-        })
+        gpu_meshes.append({"vao": vao, "count": count, "tex": tex})
 
-    print(f"相机位置: {cam_pos}, FOV: {cam_fov}")
-    print("操作: 左键旋转, 右键/滚轮缩放, Esc退出")
+    renderer = OffscreenRenderer(RENDER_W, RENDER_H)
+    # 释放 GL context，让 worker 线程可以获取
+    glfw.make_context_current(None)
+    print("\nOpenGL 初始化完成！")
+    return list(env_cubemaps.keys())
 
-    while not glfw.window_should_close(window):
-        glfw.poll_events()
-        fb_w, fb_h = glfw.get_framebuffer_size(window)
-        glViewport(0, 0, fb_w, fb_h)
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-        aspect = fb_w / fb_h if fb_h > 0 else 1.0
-        projection = glm.perspective(glm.radians(cam_fov), aspect, 0.01, 100.0)
-        eye = glm.vec3(cam_pos[0], cam_pos[1], cam_pos[2] + zoom_offset)
-        target = glm.vec3(center[0], center[1], center[2])
-        view = glm.lookAt(eye, target, glm.vec3(0, 1, 0))
+def render_frame(roughness, metallic, rot_x, rot_y, zoom, show_skybox, env_name):
+    global env_cubemap, irr_cubemap, pref_cubemap, brdf_tex
 
-        model = glm.mat4(1.0)
-        model = glm.rotate(model, glm.radians(rotation_x), glm.vec3(1, 0, 0))
-        model = glm.rotate(model, glm.radians(rotation_y), glm.vec3(0, 1, 0))
-        normal_mat = glm.mat3(glm.transpose(glm.inverse(model)))
+    gl_lock.acquire()
+    glfw.make_context_current(gl_window)
 
-        # 绘制椅子 (PBR + IBL)
-        glUseProgram(pbr_shader)
-        glUniformMatrix4fv(glGetUniformLocation(pbr_shader, "model"), 1, GL_FALSE, glm.value_ptr(model))
-        glUniformMatrix4fv(glGetUniformLocation(pbr_shader, "view"), 1, GL_FALSE, glm.value_ptr(view))
-        glUniformMatrix4fv(glGetUniformLocation(pbr_shader, "projection"), 1, GL_FALSE, glm.value_ptr(projection))
-        glUniformMatrix3fv(glGetUniformLocation(pbr_shader, "normalMatrix"), 1, GL_FALSE, glm.value_ptr(normal_mat))
-        glUniform3f(glGetUniformLocation(pbr_shader, "camPos"), eye.x, eye.y, eye.z)
+    if env_name in env_cubemaps:
+        env_cubemap = env_cubemaps[env_name]["env"]
+        irr_cubemap = env_cubemaps[env_name]["irr"]
+        pref_cubemap = env_cubemaps[env_name]["pref"]
+        brdf_tex = env_cubemaps[env_name]["brdf"]
 
-        glActiveTexture(GL_TEXTURE1)
-        glBindTexture(GL_TEXTURE_CUBE_MAP, irr_cubemap)
-        glUniform1i(glGetUniformLocation(pbr_shader, "irradianceMap"), 1)
-        glActiveTexture(GL_TEXTURE2)
-        glBindTexture(GL_TEXTURE_CUBE_MAP, pref_cubemap)
-        glUniform1i(glGetUniformLocation(pbr_shader, "prefilterMap"), 2)
-        glActiveTexture(GL_TEXTURE3)
-        glBindTexture(GL_TEXTURE_2D, brdf_tex)
-        glUniform1i(glGetUniformLocation(pbr_shader, "brdfLUT"), 3)
+    glBindFramebuffer(GL_FRAMEBUFFER, renderer.fbo)
+    glViewport(0, 0, RENDER_W, RENDER_H)
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    glDepthFunc(GL_LESS)
 
-        for gm in gpu_meshes:
-            glUniform1f(glGetUniformLocation(pbr_shader, "metallic"), gm["metallic"])
-            glUniform1f(glGetUniformLocation(pbr_shader, "roughness"), gm["roughness"])
-            glActiveTexture(GL_TEXTURE0)
-            glBindTexture(GL_TEXTURE_2D, gm["tex"])
-            glUniform1i(glGetUniformLocation(pbr_shader, "albedoMap"), 0)
-            glBindVertexArray(gm["vao"])
-            glDrawElements(GL_TRIANGLES, gm["count"], GL_UNSIGNED_INT, None)
+    aspect = RENDER_W / RENDER_H
+    projection = glm.perspective(glm.radians(cam_fov), aspect, 0.01, 100.0)
+    eye = glm.vec3(cam_pos[0], cam_pos[1], cam_pos[2] + zoom)
+    target = glm.vec3(center[0], center[1], center[2])
+    view = glm.lookAt(eye, target, glm.vec3(0, 1, 0))
 
-        # 绘制天空盒
+    model = glm.mat4(1.0)
+    model = glm.rotate(model, glm.radians(rot_x), glm.vec3(1, 0, 0))
+    model = glm.rotate(model, glm.radians(rot_y), glm.vec3(0, 1, 0))
+    normal_mat = glm.mat3(glm.transpose(glm.inverse(model)))
+
+    # PBR 椅子
+    glUseProgram(pbr_shader)
+    glUniformMatrix4fv(glGetUniformLocation(pbr_shader, "model"), 1, GL_FALSE, glm.value_ptr(model))
+    glUniformMatrix4fv(glGetUniformLocation(pbr_shader, "view"), 1, GL_FALSE, glm.value_ptr(view))
+    glUniformMatrix4fv(glGetUniformLocation(pbr_shader, "projection"), 1, GL_FALSE, glm.value_ptr(projection))
+    glUniformMatrix3fv(glGetUniformLocation(pbr_shader, "normalMatrix"), 1, GL_FALSE, glm.value_ptr(normal_mat))
+    glUniform3f(glGetUniformLocation(pbr_shader, "camPos"), eye.x, eye.y, eye.z)
+
+    glActiveTexture(GL_TEXTURE1)
+    glBindTexture(GL_TEXTURE_CUBE_MAP, irr_cubemap)
+    glUniform1i(glGetUniformLocation(pbr_shader, "irradianceMap"), 1)
+    glActiveTexture(GL_TEXTURE2)
+    glBindTexture(GL_TEXTURE_CUBE_MAP, pref_cubemap)
+    glUniform1i(glGetUniformLocation(pbr_shader, "prefilterMap"), 2)
+    glActiveTexture(GL_TEXTURE3)
+    glBindTexture(GL_TEXTURE_2D, brdf_tex)
+    glUniform1i(glGetUniformLocation(pbr_shader, "brdfLUT"), 3)
+
+    for gm in gpu_meshes:
+        glUniform1f(glGetUniformLocation(pbr_shader, "metallic"), metallic)
+        glUniform1f(glGetUniformLocation(pbr_shader, "roughness"), roughness)
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, gm["tex"])
+        glUniform1i(glGetUniformLocation(pbr_shader, "albedoMap"), 0)
+        glBindVertexArray(gm["vao"])
+        glDrawElements(GL_TRIANGLES, gm["count"], GL_UNSIGNED_INT, None)
+
+    # 天空盒
+    if show_skybox:
         glDepthFunc(GL_LEQUAL)
         glDepthMask(GL_FALSE)
         glUseProgram(skybox_shader)
@@ -648,9 +669,49 @@ def main():
         glDepthMask(GL_TRUE)
         glDepthFunc(GL_LESS)
 
-        glfw.swap_buffers(window)
+    glBindFramebuffer(GL_FRAMEBUFFER, 0)
+    img = renderer.read_pixels()
+    glfw.make_context_current(None)
+    gl_lock.release()
+    return img
 
-    glfw.terminate()
+
+# ============ Gradio UI ============
+
+def main():
+    env_names = init_gl()
+    default_env = "Regal_Palace_Ballroom_cubemap" if "Regal_Palace_Ballroom_cubemap" in env_names else env_names[0]
+
+    def on_change(roughness, metallic, rot_x, rot_y, zoom, show_skybox, env_name):
+        return render_frame(roughness, metallic, rot_x, rot_y, zoom, show_skybox, env_name)
+
+    with gr.Blocks(title="PBR Chair Viewer") as demo:
+        gr.Markdown("## PBR 椅子渲染器 — 交互式参数调节")
+
+        with gr.Row():
+            with gr.Column(scale=3):
+                img_out = gr.Image(label="渲染结果", type="pil", height=500)
+            with gr.Column(scale=1):
+                env_dropdown = gr.Dropdown(choices=env_names, value=default_env, label="环境贴图")
+                roughness_sl = gr.Slider(0.0, 1.0, value=0.7, step=0.01, label="Roughness 粗糙度")
+                metallic_sl = gr.Slider(0.0, 1.0, value=0.0, step=0.01, label="Metallic 金属度")
+                rot_x_sl = gr.Slider(-90, 90, value=0, step=1, label="旋转 X")
+                rot_y_sl = gr.Slider(-180, 180, value=0, step=1, label="旋转 Y")
+                zoom_sl = gr.Slider(-1.0, 3.0, value=0.0, step=0.05, label="缩放")
+                skybox_cb = gr.Checkbox(value=True, label="显示天空盒")
+                render_btn = gr.Button("渲染", variant="primary")
+
+        inputs = [roughness_sl, metallic_sl, rot_x_sl, rot_y_sl, zoom_sl, skybox_cb, env_dropdown]
+        render_btn.click(fn=on_change, inputs=inputs, outputs=img_out)
+
+        for sl in [roughness_sl, metallic_sl, rot_x_sl, rot_y_sl, zoom_sl]:
+            sl.release(fn=on_change, inputs=inputs, outputs=img_out)
+        skybox_cb.change(fn=on_change, inputs=inputs, outputs=img_out)
+        env_dropdown.change(fn=on_change, inputs=inputs, outputs=img_out)
+
+        demo.load(fn=on_change, inputs=inputs, outputs=img_out)
+
+    demo.launch(server_name="0.0.0.0", server_port=7860)
 
 
 if __name__ == "__main__":
